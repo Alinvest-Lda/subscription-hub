@@ -4,6 +4,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/hooks/use-toast";
+import { calculateInvoiceTotals, formatMt, nextOriginReference, parseAmountFromLabel } from "@/lib/billing";
+import { initiateMpesaPayment } from "@/lib/mpesa";
 import { motion } from "framer-motion";
 import {
   ArrowLeft, ArrowRight, Upload, CheckCircle2, Smartphone, Building2, Shield, FileUp,
@@ -17,7 +19,7 @@ const paymentMethods = [
   { id: "banco" as PaymentMethod, label: "Transferência Bancária", icon: Building2, details: "Banco: BCI\nConta: 00000000000\nNIB: 0000.0000.0000.0000.0000.0\nTitular: ACJL Lda" },
 ];
 
-const EMAIL_DESTINO = "info@acjl.co.mz";
+const EMAIL_DESTINO = "acjl.corporate@gmail.com";
 
 export default function CheckoutAvulso() {
   const [searchParams] = useSearchParams();
@@ -31,6 +33,10 @@ export default function CheckoutAvulso() {
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | "">("");
   const [file, setFile] = useState<File | null>(null);
   const [sending, setSending] = useState(false);
+  const [mpesaPhone, setMpesaPhone] = useState("");
+  const [mpesaLoading, setMpesaLoading] = useState(false);
+  const [mpesaTransactionId, setMpesaTransactionId] = useState("");
+  const [reference] = useState(() => nextOriginReference("AVU"));
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [form, setForm] = useState({
@@ -38,7 +44,10 @@ export default function CheckoutAvulso() {
   });
 
   const canProceedForm = form.nome && form.email && form.telefone;
-  const canProceedPayment = paymentMethod !== "";
+  const canProceedPayment = paymentMethod !== "" && (paymentMethod !== "mpesa" || !!mpesaTransactionId);
+  const isMpesa = paymentMethod === "mpesa";
+  const parsedPrice = parseAmountFromLabel(price);
+  const invoiceTotals = calculateInvoiceTotals(parsedPrice);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -52,7 +61,7 @@ export default function CheckoutAvulso() {
   };
 
   const handleSubmit = async () => {
-    if (!file) {
+    if (!isMpesa && !file) {
       toast({ title: "Envie o comprovativo de pagamento", variant: "destructive" });
       return;
     }
@@ -61,8 +70,11 @@ export default function CheckoutAvulso() {
     const subject = encodeURIComponent(`[Serviço Avulso] ${service} - ${form.empresa || form.nome}`);
     const body = encodeURIComponent(
       `PEDIDO DE SERVIÇO AVULSO\n\n` +
+      `Referência: ${reference}\n` +
       `Serviço: ${service}\n` +
-      `Preço Indicativo: ${price}\n` +
+      `Subtotal: ${formatMt(invoiceTotals.subtotal)}\n` +
+      `IVA (16%): ${formatMt(invoiceTotals.ivaAmount)}\n` +
+      `Total Cobrado: ${formatMt(invoiceTotals.totalAmount)}\n` +
       `Método de Pagamento: ${paymentMethod}\n\n` +
       `DADOS DO CLIENTE\n` +
       `Nome: ${form.nome}\n` +
@@ -71,13 +83,94 @@ export default function CheckoutAvulso() {
       `Email: ${form.email}\n` +
       `Telefone: ${form.telefone}\n\n` +
       `Detalhes Adicionais: ${form.detalhes || "Nenhum"}\n\n` +
-      `NOTA: O comprovativo de pagamento "${file.name}" deve ser enviado por WhatsApp ou email directo.`
+      `${isMpesa && mpesaTransactionId ? `ID da Transacção M-Pesa: ${mpesaTransactionId}\n` : ""}` +
+      (
+        isMpesa
+          ? "NOTA: Pagamento processado via API M-Pesa."
+          : `NOTA: O comprovativo de pagamento "${file?.name}" deve ser enviado por WhatsApp ou email directo.`
+      )
     );
 
     window.open(`mailto:${EMAIL_DESTINO}?subject=${subject}&body=${body}`, "_blank");
-    toast({ title: "Email preparado!", description: "Complete o envio no seu cliente de email." });
+    if (isMpesa) {
+      const customerSubject = encodeURIComponent(`Confirmação de Pagamento ACJL - ${reference}`);
+      const customerBody = encodeURIComponent(
+        `Olá ${form.nome},\n\n` +
+        `Confirmamos o registo do seu pagamento online.\n` +
+        `Referência: ${reference}\n` +
+        `Serviço: ${service}\n` +
+        `Subtotal: ${formatMt(invoiceTotals.subtotal)}\n` +
+        `IVA (16%): ${formatMt(invoiceTotals.ivaAmount)}\n` +
+        `Total: ${formatMt(invoiceTotals.totalAmount)}\n` +
+        `${mpesaTransactionId ? `Transação M-Pesa: ${mpesaTransactionId}\n` : ""}\n` +
+        `Factura digital: ${service} | ${formatMt(invoiceTotals.totalAmount)}\n\n` +
+        `Obrigado por confiar na ACJL.`
+      );
+      window.open(`mailto:${form.email}?subject=${customerSubject}&body=${customerBody}`, "_blank");
+    }
+    toast({ title: "Email preparado!", description: "Notificação preparada para ACJL e confirmação enviada ao cliente (quando pagamento online)." });
     setStep("done");
     setSending(false);
+  };
+
+  const handleMpesaPayment = async () => {
+    if (!mpesaPhone) {
+      toast({ title: "Informe o número M-Pesa", variant: "destructive" });
+      return;
+    }
+
+    if (!parsedPrice) {
+      toast({ title: "Valor inválido para pagamento", variant: "destructive" });
+      return;
+    }
+
+    try {
+      setMpesaLoading(true);
+      const result = await initiateMpesaPayment({
+        amount: Math.round(invoiceTotals.totalAmount),
+        phoneNumber: mpesaPhone,
+        accountReference: `AVULSO-${service}`.slice(0, 20),
+        transactionDesc: `Serviço ${service}`,
+      });
+
+      if (!result.success) {
+        throw new Error(result.message || "Falha no processamento M-Pesa.");
+      }
+
+      setMpesaTransactionId(result.transactionId || "sem-referencia");
+      toast({
+        title: "Pedido M-Pesa enviado",
+        description: result.message || "Confirme o pagamento no telemóvel e continue.",
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Não foi possível iniciar o pagamento M-Pesa.";
+      toast({ title: "Erro no pagamento M-Pesa", description: message, variant: "destructive" });
+    } finally {
+      setMpesaLoading(false);
+    }
+  };
+
+  const invoiceText = [
+    "FACTURA DIGITAL - ACJL",
+    `Referência: ${reference}`,
+    `Cliente: ${form.empresa || form.nome}`,
+    `Contacto: ${form.nome} | ${form.email} | ${form.telefone}`,
+    `Serviço: ${service}`,
+    `Subtotal: ${formatMt(invoiceTotals.subtotal)}`,
+    `IVA (16%): ${formatMt(invoiceTotals.ivaAmount)}`,
+    `Total pago: ${formatMt(invoiceTotals.totalAmount)}`,
+    `Método: ${paymentMethods.find((p) => p.id === paymentMethod)?.label || paymentMethod}`,
+    `${mpesaTransactionId ? `Transação M-Pesa: ${mpesaTransactionId}` : ""}`,
+  ].filter(Boolean).join("\n");
+
+  const downloadDigitalInvoice = () => {
+    const blob = new Blob([invoiceText], { type: "text/plain;charset=utf-8" });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `factura-${reference}.txt`;
+    link.click();
+    window.URL.revokeObjectURL(url);
   };
 
   if (step === "done") {
@@ -95,6 +188,14 @@ export default function CheckoutAvulso() {
                   Recebemos o seu pedido para <strong>{service}</strong>. A equipa validará o pagamento em até 24h.
                 </p>
               </div>
+              <div className="rounded-lg bg-muted/50 p-4 text-sm text-left space-y-1">
+                <p><strong>Referência:</strong> {reference}</p>
+                <p><strong>Total:</strong> {formatMt(invoiceTotals.totalAmount)}</p>
+                <p><strong>Email:</strong> {form.email}</p>
+              </div>
+              <Button variant="outline" onClick={downloadDigitalInvoice} className="w-full">
+                Baixar Factura Digital
+              </Button>
               <Button onClick={() => navigate("/")} className="w-full gap-2">
                 Voltar ao Início <ArrowRight className="h-4 w-4" />
               </Button>
@@ -118,7 +219,7 @@ export default function CheckoutAvulso() {
           </div>
           <div>
             <h1 className="text-xl font-bold">{service}</h1>
-            {price && <p className="text-sm text-muted-foreground">{price} + IVA</p>}
+            {price && <p className="text-sm text-muted-foreground">{formatMt(invoiceTotals.totalAmount)} (IVA incluído)</p>}
           </div>
         </div>
 
@@ -186,7 +287,13 @@ export default function CheckoutAvulso() {
                 <p className="text-sm text-muted-foreground">Seleccione o método e efectue a transferência.</p>
                 <div className="grid gap-3">
                   {paymentMethods.map((pm) => (
-                    <button key={pm.id} onClick={() => setPaymentMethod(pm.id)}
+                    <button key={pm.id} onClick={() => {
+                      setPaymentMethod(pm.id);
+                      setMpesaTransactionId("");
+                      if (pm.id === "mpesa") {
+                        setMpesaPhone(form.telefone);
+                      }
+                    }}
                       className={`w-full text-left rounded-xl border p-4 transition-all hover:border-primary/50 ${paymentMethod === pm.id ? "border-primary bg-primary/5" : "border-border"}`}>
                       <div className="flex items-center gap-3">
                         <div className={`h-10 w-10 rounded-lg flex items-center justify-center ${paymentMethod === pm.id ? "bg-primary text-primary-foreground" : "bg-muted"}`}>
@@ -203,8 +310,28 @@ export default function CheckoutAvulso() {
                     </button>
                   ))}
                 </div>
+                {isMpesa && (
+                  <div className="space-y-3 rounded-lg border border-primary/20 bg-primary/5 p-4">
+                    <p className="text-xs text-muted-foreground">
+                      Pagamento automático via API M-Pesa: use um número válido para receber o prompt no telemóvel.
+                    </p>
+                    <Input
+                      value={mpesaPhone}
+                      onChange={(e) => setMpesaPhone(e.target.value)}
+                      placeholder="+258 84 000 0000"
+                    />
+                    <Button type="button" variant="outline" disabled={mpesaLoading || !mpesaPhone} onClick={handleMpesaPayment}>
+                      {mpesaLoading ? "A processar..." : "Pagar com M-Pesa API"}
+                    </Button>
+                    {mpesaTransactionId && (
+                      <p className="text-xs text-success font-medium">
+                        Pagamento iniciado com sucesso. Referência: {mpesaTransactionId}
+                      </p>
+                    )}
+                  </div>
+                )}
                 <Button className="w-full gap-2" disabled={!canProceedPayment} onClick={() => setStep("upload")}>
-                  Já Efectuei o Pagamento <ArrowRight className="h-4 w-4" />
+                  {isMpesa ? "Continuar" : "Já Efectuei o Pagamento"} <ArrowRight className="h-4 w-4" />
                 </Button>
               </CardContent>
             </Card>
@@ -216,36 +343,48 @@ export default function CheckoutAvulso() {
             <Card>
               <CardHeader><CardTitle>Enviar Comprovativo</CardTitle></CardHeader>
               <CardContent className="space-y-4">
-                <p className="text-sm text-muted-foreground">Faça upload do comprovativo de pagamento para validação.</p>
-                <input ref={fileInputRef} type="file" accept="image/*,.pdf" className="hidden" onChange={handleFileChange} />
-                <button onClick={() => fileInputRef.current?.click()}
-                  className={`w-full rounded-xl border-2 border-dashed p-8 text-center transition-all hover:border-primary/50 ${file ? "border-primary bg-primary/5" : "border-border"}`}>
-                  {file ? (
-                    <div className="flex items-center justify-center gap-3">
-                      <FileUp className="h-8 w-8 text-primary" />
-                      <div className="text-left">
-                        <p className="text-sm font-semibold">{file.name}</p>
-                        <p className="text-xs text-muted-foreground">{(file.size / 1024).toFixed(0)} KB</p>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="space-y-2">
-                      <Upload className="h-10 w-10 text-muted-foreground mx-auto" />
-                      <p className="text-sm font-medium">Clique para enviar</p>
-                      <p className="text-xs text-muted-foreground">PNG, JPG ou PDF até 10MB</p>
-                    </div>
-                  )}
-                </button>
+                <p className="text-sm text-muted-foreground">
+                  {isMpesa
+                    ? "Pagamento iniciado via M-Pesa API. Confirme os dados abaixo e finalize o pedido."
+                    : "Faça upload do comprovativo de pagamento para validação."}
+                </p>
+                {!isMpesa && (
+                  <>
+                    <input ref={fileInputRef} type="file" accept="image/*,.pdf" className="hidden" onChange={handleFileChange} />
+                    <button onClick={() => fileInputRef.current?.click()}
+                      className={`w-full rounded-xl border-2 border-dashed p-8 text-center transition-all hover:border-primary/50 ${file ? "border-primary bg-primary/5" : "border-border"}`}>
+                      {file ? (
+                        <div className="flex items-center justify-center gap-3">
+                          <FileUp className="h-8 w-8 text-primary" />
+                          <div className="text-left">
+                            <p className="text-sm font-semibold">{file.name}</p>
+                            <p className="text-xs text-muted-foreground">{(file.size / 1024).toFixed(0)} KB</p>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <Upload className="h-10 w-10 text-muted-foreground mx-auto" />
+                          <p className="text-sm font-medium">Clique para enviar</p>
+                          <p className="text-xs text-muted-foreground">PNG, JPG ou PDF até 10MB</p>
+                        </div>
+                      )}
+                    </button>
+                  </>
+                )}
 
                 <div className="rounded-lg bg-muted/50 p-4 space-y-2 text-sm">
                   <p className="font-semibold">Resumo do Pedido</p>
+                  <div className="flex justify-between"><span className="text-muted-foreground">Referência</span><span className="font-medium">{reference}</span></div>
                   <div className="flex justify-between"><span className="text-muted-foreground">Serviço</span><span className="font-medium">{service}</span></div>
-                  {price && <div className="flex justify-between"><span className="text-muted-foreground">Valor Indicativo</span><span className="font-medium">{price}</span></div>}
+                  {price && <div className="flex justify-between"><span className="text-muted-foreground">Subtotal</span><span className="font-medium">{formatMt(invoiceTotals.subtotal)}</span></div>}
+                  {price && <div className="flex justify-between"><span className="text-muted-foreground">IVA (16%)</span><span className="font-medium">{formatMt(invoiceTotals.ivaAmount)}</span></div>}
+                  {price && <div className="flex justify-between"><span className="text-muted-foreground">Total</span><span className="font-medium">{formatMt(invoiceTotals.totalAmount)}</span></div>}
                   <div className="flex justify-between"><span className="text-muted-foreground">Pagamento</span><span className="font-medium">{paymentMethods.find(p => p.id === paymentMethod)?.label}</span></div>
+                  {isMpesa && <div className="flex justify-between"><span className="text-muted-foreground">Referência M-Pesa</span><span className="font-medium">{mpesaTransactionId}</span></div>}
                   <div className="flex justify-between"><span className="text-muted-foreground">Cliente</span><span className="font-medium">{form.nome}</span></div>
                 </div>
 
-                <Button className="w-full gap-2" disabled={!file || sending} onClick={handleSubmit}>
+                <Button className="w-full gap-2" disabled={(!isMpesa && !file) || sending} onClick={handleSubmit}>
                   {sending ? "A enviar..." : "Confirmar e Enviar"} <ArrowRight className="h-4 w-4" />
                 </Button>
               </CardContent>
